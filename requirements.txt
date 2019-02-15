@@ -1,0 +1,15 @@
+tensorflow
+numpy
+flask
+flask_restplus
+flask-sqlalchemy
+flask-migrate
+flask_restful_swagger
+requests
+psycopg2-binary
+flask-cors
+pygrok
+pandas
+sklearn
+
+
