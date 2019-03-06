@@ -3,9 +3,13 @@ import numpy as np
 import pandas as pd
 import pickle
 import math
+from data_preparator import prepare_data, prepare_log_row
+from bo.models import NetworkParameter
+from bo.network_dao import add_network_parameter
 
 # save_path = './models/'
 save_path = '../data/model/'
+
 
 class SOM:
     """
@@ -266,10 +270,9 @@ def train_model(X):
     return model
 
 
-def load_model(X):
-    if X is None:
-        raise ValueError("No data")
-    n_dim = X.shape[1]
+def load_trained_model(network):
+    train_data = check_if_trained(network)
+    n_dim = train_data.shape[1]
     size = 2
     global model
     model = SOM(size, size, n_dim, 800, sigma=2)
@@ -281,7 +284,7 @@ def load_model(X):
     return model
 
 
-def predict(x):
+def predict(x, additional_data=None):
     winner = model.winner(x)
     winner_loc = winner[1]
     bmu = centroids[winner_loc[0]][winner_loc[1]]
@@ -290,3 +293,28 @@ def predict(x):
         return 'abnormal'
     else:
         return 'normal'
+
+
+def check_if_trained(network):
+    trained = False
+    train_path = ""
+
+    global pattern
+    pattern = None
+
+    for parameter in network.parameters:
+        if parameter.abbreviation == "IS_TRAINED" and parameter.value is not None and parameter.value.lower() == 'true':
+            trained = True
+
+        if parameter.abbreviation == "TRAIN_DATA_PATH":
+            train_path = parameter.value
+
+        if parameter.abbreviation == "DATA_PATTERN":
+            pattern = parameter.value
+
+    train_data = prepare_data(train_path, pattern)
+    if trained is False:
+        train_model(train_data)
+        parameter = NetworkParameter('IS_TRAINED', 'IS_TRAINED', True, network.network_id)
+        add_network_parameter(parameter)
+    return train_data

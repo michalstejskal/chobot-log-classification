@@ -1,145 +1,97 @@
 import base64
-import binascii
+import datetime
 import json
 import os
-from functools import wraps
+import time
 
+import psycopg2.extensions
 import requests
-from configuration.app_config import app, db, ns, api
-from configuration.connection import connection_port
+from api_security import require_appkey
+from bo.network_dao import get_network
+from configuration.app_config import app, ns, api, api_port, debug_server
+from data_preparator import prepare_data, prepare_log_row
 from flask import abort
 from flask import jsonify, request
 from flask_restful_swagger import swagger
 from flask_restplus import Resource
-from models.models import Network, NetworkParameter
-from data_preparator import prepare_data, prepare_log_row
-from network_model import load_model, predict, train_model
-from sqlalchemy.dialects.postgresql import psycopg2
+from network_model import load_trained_model, predict
+from requests.packages import package
 
-import psycopg2
-import psycopg2.extensions
 psycopg2.extensions.register_type(psycopg2.extensions.UNICODE)
 psycopg2.extensions.register_type(psycopg2.extensions.UNICODEARRAY)
 
 
-def require_appkey(view_function):
-    @wraps(view_function)
-    # the new, post-decoration function. Note *args and **kwargs here.
-    def decorated_function(*args, **kwargs):
-        print('check authorization')
-        api_key_result, network = check_api_key(request)
-        if api_key_result:
-            if check_secret(request, network):
-                return view_function(*args, **kwargs)
-
-        print('request abbort -- 401')
-        abort(401)
-
-    return decorated_function
-
-
-def check_api_key(request_input):
-    if request_input.headers.get('Authorization'):
-        print('check api key')
-        api_key_dict = convert_to_dict(request_input.headers.get('Authorization'))
-        id = api_key_dict['network_id']
-        api_key_secret = api_key_dict['api_key']
-        request_input.headers.get('netw-sec: ' + api_key_secret)
-
-        try:
-            network = db.session.query(Network).get(id)
-        except:
-            db.session.commit()
-            db.session.close()
-            network = db.session.query(Network).get(id)
-
-        if network is not None and network.network_id == id and network.api_key_secret == api_key_secret:
-            print('api key check successful')
-            print(network)
-            return True, network
-
-    print('api key check unsuccessful')
-    return False, None
-
-
-def check_secret(request_input, network):
-    if request_input.headers.get('Secret'):
-        print('check user secret')
-        secret_dict = convert_to_dict(request_input.headers.get('Secret'))
-        if network.user.secret == secret_dict['secret']:
-            print('check user secret successful')
-            db.session.commit()
-            db.session.close()
-            return True
-    print('check user secret unsuccessful')
-    db.session.commit()
-    db.session.close()
-    return False
-
-
-def convert_to_dict(request_header):
-    try:
-        input_json = base64.b64decode(str(request_header))
-        return json.loads(input_json.decode("utf-8"))
-    except binascii.Error:
-        print('unable to decode input')
-        abort(400)
+@ns.route('/swagger2.json')
+class ApiDocsController(Resource):
+    def get(self):
+        with app.app_context():
+            schema = api.__schema__
+            schema['basePath'] = os.environ['API_URI']
+            return jsonify(schema)
 
 
 @ns.route('/healtz')
 class HealthController(Resource):
+    '''Check if app is running and know its id'''
+
     @swagger.operation()
     def get(self):
-        return jsonify("true")
+        network = get_network(network_id)
+        if network is not None:
+            return jsonify("true")
 
 
 @ns.route('/network/predict')
 class NetworkController(Resource):
-    '''Predict from user image'''
+    '''Classify based on user input'''
 
     post_parser = api.parser()
     post_parser.add_argument('Authorization', type=str, location='headers', required=True)
-    post_parser.add_argument('Secret', type=str, location='headers', required=True)
+    post_parser.add_argument("data", type=package, location="json")
+
+    # post_parser.add_argument('file', location='files',type=FileStorage, required=True)
 
     @api.expect(post_parser, validate=True)
     @require_appkey
-    @swagger.operation()
     def post(self):
         data = {"success": False}
-        # ensure an image was properly uploaded to our endpoint
-        if request.method == "POST":
-            if request.data is not None:
-                messageDict = request.json
-                if messageDict is not None and 'message' in messageDict:
-                    log = base64.b64decode(str(messageDict['message']))
-                    x = prepare_log_row(log, pattern)
-                    if x is not None:
-                        classification = predict(x)
-                        data["classification"] = classification
-                        data["success"] = True
 
-                        network = self.get_network(request.headers.get('Authorization'))
-                        data = self.call_modules(network, classification, data)
-                else:
-                    abort(400)
+        input_data, additional_data = self.get_request_data(request)
+        if input_data is not None:
 
-        db.session.commit()
-        db.session.close()
+            classification = predict(input_data, additional_data)
+            data["main_class"] = classification
+            ts = time.time()
+            data['timestamp'] = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+            data["success"] = True
+            data['user_request'] = input_data
+            main_label = data["main_class"]
+
+            network = get_network(network_id)
+            data = self.call_modules(network, main_label, data)
+        else:
+            abort(400)
+
         return jsonify(data)
 
-    def get_network(self, auth_header):
-        auth_header = convert_to_dict(auth_header)
+    def get_request_data(self, request):
+        input_data = request.json
 
-        network = db.session.query(Network).get(auth_header['network_id'])
-        return network
+        if input_data is not None and 'message' in input_data:
+            data = input_data['message']
+            decoded_log = base64.b64decode(str(data))
+            parsed_data = prepare_log_row(decoded_log, pattern)
+            if 'message_context' in input_data:
+                return parsed_data, input_data['message_context']
+
+            return parsed_data, None
+
+        return None
 
     def call_modules(self, network, main_label, data):
         for module in network.modules:
             if module.response_class == main_label and module.status == 4:
-                headers = {
-                    "Authorization": module.api_key,
-                    "Secret": module.network.user.secret
-                }
+                headers = {"Authorization": module.api_key, "Secret": module.network.user.secret}
 
                 response = requests.get('http://' + module.connection_uri_internal, data=data, headers=headers)
                 data['module_response'] = json.loads(response.content.decode("utf-8"))
@@ -175,20 +127,16 @@ def check_if_trained(network):
     return X
 
 
-def get_network():
+def configure_network():
+    global network_id
     network_id = os.environ['NETWORK_ID']
-    network = db.session.query(Network).get(network_id)
-    train_path = check_if_trained(network)
-    return train_path
+    network = get_network(network_id)
+    load_trained_model(network)
 
 
 if __name__ == "__main__":
-    print("done")
-    X = get_network()
-    load_model(X)
-    db.session.commit()
-    db.session.close()
-    app.run(debug=True, host="0.0.0.0", port=connection_port)
+    configure_network()
+    app.run(debug=debug_server, host="0.0.0.0", port=api_port)
 
 # one_row = '2016-06-04	12:00:09	200	94.199.43.237:25689	"-"	GET	"/wwwstats/f"	"?p=105:1:0:::::"	10.245.8.60:443	"www.czechpoint.cz"	HTTP/1.1	592	28765	45877	"-"	"curl/7.19.7 (x86_64-suse-linux-gnu) libcurl/7.19.7 OpenSSL/0.9.8j zlib/1.2.7 libidn/1.10"	"-"	TLSv1	DHE-RSA-AES256-SHA	"-$-"	+	7961	"proxy:http://10.245.10.45/pls/apex/f?p=105:1:0:::::"'
 # curl -X POST "localhost:5001/network/predict"  -H "accept: application/json" -H "Authorization: eyJuZXR3b3JrX2lkIjoxMDcsImFwaV9rZXkiOiJTbFJYYW1WU1dWQnhVMDlLVkVsT1RscG1XR0pvVFdsdVltTlJPVzlVYTJzPSJ9" -H "Secret: eyJzZWNyZXQiOiJkR0ZxYm1WZmFHVnpiRzg9In0=" --data '{"message":"2016-06-04	12:00:09	200	94.199.43.237:25689	"-"	GET	"/wwwstats/f"	"?p=105:1:0:::::"	10.245.8.60:443	"www.czechpoint.cz"	HTTP/1.1	592	28765	45877	"-"	"curl/7.19.7 (x86_64-suse-linux-gnu) libcurl/7.19.7 OpenSSL/0.9.8j zlib/1.2.7 libidn/1.10"	"-"	TLSv1	DHE-RSA-AES256-SHA	"-$-"	+	7961	"proxy:http://10.245.10.45/pls/apex/f?p=105:1:0:::::""}' -H "Content-Type: application/json"
